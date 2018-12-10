@@ -15,21 +15,37 @@
 //#include "rocksdb/c.h"
 #include <vector>
 #include <map>
+#include <set>
 #include "rocksdb/db.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/options.h"
 #include <bitset>
-#include <unistd.h>
+//#include <unistd.h>
+//#include <stdio.h>
+//#include <stdlib.h>
+//#include <sys/types.h>
+#include <sys/stat.h>
+//#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #define TRUE 1 
 #define FALSE 0 
-#define PORT 8888 
+#define BUFFER_SIZE 20
+#define BUFFER_START_INDEX 8
+using namespace std;
 using namespace rocksdb;
 class ColumnFamily;
 
-
-std::map<std::string, ColumnFamily> COLUMN_FAMILIES;
+void deserializeValues(string values,set<string> ,map<string, string> &result);
+string serializeValues( map<string, string> values);
+vector<unsigned char> intToBytes(int);
+int getSizeFromBuffer(char * buffer,int index);
+int getSizeFromBuffer(vector<char> buffer,int index);
+  
+map<string, ColumnFamily> COLUMN_FAMILIES;
 DB* db;
-
+char * response;
+bool debug = true;
 class ColumnFamily {
     
 private:
@@ -51,44 +67,280 @@ public:
     }
 };
 
+class MMappedBuffer{
+  
+public:
+  
+  int fd;
+  int result;
+  void* buffer;
+  char* chbuffer;
+  int ReadIndex;
+  int WriteIndex;
+  MMappedBuffer(const char * filename)
+  {
+    fd = open(filename, O_RDWR | O_CREAT, (mode_t)0600);
+    if (fd == -1) {
+      perror("Error opening file for writing");
+      exit(EXIT_FAILURE);
+    }
+    
+    /* Stretch the file size to the size of the (mmapped) array of ints
+     */
+    result = lseek(fd, BUFFER_SIZE + BUFFER_START_INDEX, SEEK_SET);
+    if (result == -1) {
+      close(fd);
+      perror("Error calling lseek() to 'stretch' the file");
+      exit(EXIT_FAILURE);
+    }
+    
+    result = write(fd, "", 1);
+    if (result != 1) {
+      close(fd);
+      perror("Error writing last byte of the file");
+      exit(EXIT_FAILURE);
+    }
 
+    buffer = mmap(0, BUFFER_SIZE + BUFFER_START_INDEX, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    
+    if (buffer == MAP_FAILED) {
+	close(fd);
+	perror("Error mmapping the reponse file");
+	exit(EXIT_FAILURE);
+    }
+    chbuffer = (char*) buffer;
+    setReadIndex(BUFFER_START_INDEX);
+    setWriteIndex(BUFFER_START_INDEX);
+  }
 
-void createColumnFamily(std::string name){
+  ~MMappedBuffer()
+  {
+    if (munmap(buffer, BUFFER_SIZE) == -1) {
+      perror("Error un-mmapping the response file");
+      /* Decide here whether to close(fd) and exit() or not. Depends... */
+    }
+    close(fd);
+  }
+
+  void setReadIndex(int newIndex)
+  {
+    cout << "New read index " << newIndex << "\n";
+    ReadIndex = newIndex;
+    vector<unsigned char> num = intToBytes(newIndex);
+    chbuffer[4] = num[0];
+    chbuffer[5] = num[1];
+    chbuffer[6] = num[2];
+    chbuffer[7] = num[3];
+  }
+
+  void setWriteIndex(int newIndex)
+  {
+    WriteIndex = newIndex;
+    vector<unsigned char> num = intToBytes(newIndex);
+    chbuffer[0] = num[0]; 
+    chbuffer[1] = num[1];
+    chbuffer[2] = num[2];
+    chbuffer[3] = num[3];
+  } 
+
+  //int size = int( (unsigned char)(buffer[index]) << 24 | (unsigned char)(buffer[index+1]) << 16 | (unsigned char)(buffer[index+2]) << 8 | (unsigned char)(buffer[index+3]) ); 
+  
+  int getIntFromBuffer(int index)
+  {
+    int nextAccessIndex = index;
+    int result;
+    vector<char> temp;
+    for(int i = 0;i < 4; i++)
+      {
+	cout<< "Next Access Index : " << nextAccessIndex <<endl;
+	//	result |= (int)((unsigned char)(chbuffer[nextAccessIndex]) << (3 - i)*8); 
+	temp.push_back(chbuffer[nextAccessIndex]);
+	if(nextAccessIndex < BUFFER_SIZE + BUFFER_START_INDEX - 1)
+	  {
+	    nextAccessIndex++;
+	  }
+	else nextAccessIndex = BUFFER_START_INDEX;
+      }
+    setReadIndex(nextAccessIndex);
+    return getSizeFromBuffer(temp,0);
+  }
+  
+  
+  vector<char> readNext()
+  {
+    vector<char> result;
+    WriteIndex = getWriteIndex();
+    if(ReadIndex != WriteIndex)      
+      {// this means we have some data to read
+       // first we have to get the next request in vector form
+	cout<<"Found unread data, write index: "<< WriteIndex << " , Read Index: " << ReadIndex <<endl;
+	int msgSize = getIntFromBuffer(ReadIndex);
+	cout<<"Message Size " << msgSize << endl;
+	int bytesToReadTillEndOfBuffer = BUFFER_SIZE + BUFFER_START_INDEX - ReadIndex;
+	cout<< "Bytes to read till end of buffer: " << bytesToReadTillEndOfBuffer << endl;
+	if(bytesToReadTillEndOfBuffer <= msgSize)
+	  {
+	    cout<<"Spliting data to be read \n";
+	    result.assign(chbuffer + ReadIndex, chbuffer + ReadIndex + bytesToReadTillEndOfBuffer);
+	    result.insert(result.end(),chbuffer + BUFFER_START_INDEX, chbuffer + BUFFER_START_INDEX + msgSize - bytesToReadTillEndOfBuffer);
+	    setReadIndex(BUFFER_START_INDEX + msgSize - bytesToReadTillEndOfBuffer);
+	  }
+	else
+	  {
+	    cout<<"Reading normally \n";
+	    result.assign(chbuffer + ReadIndex, chbuffer + ReadIndex + msgSize);
+	    setReadIndex(ReadIndex + msgSize);
+	  }
+	return result;
+      }
+    // else cout<<"Nothing to read \n";
+  }
+
+  void addToBuffer(string response)
+    // writes response starting at position WriteIndex, overlaps if reaches end of buffer
+	
+    {
+	bool added = false;
+	while(!added)
+	    {
+		int bytesAvailable = getBytesAvailable();
+		cout << "Bytes available: " << bytesAvailable << " \n";
+		if(bytesAvailable >= response.length())
+		    {
+		      if(BUFFER_SIZE + BUFFER_START_INDEX - WriteIndex <= response.length()) // need to overlap
+			    {
+			      cout<< "Splitting \n";
+			      copy(response.begin(),response.begin() + BUFFER_SIZE + BUFFER_START_INDEX - WriteIndex, chbuffer + WriteIndex);
+			      copy(response.begin() + BUFFER_SIZE + BUFFER_START_INDEX - WriteIndex , response.end(), chbuffer + BUFFER_START_INDEX);
+			      setWriteIndex(BUFFER_START_INDEX + response.length() - (BUFFER_SIZE + BUFFER_START_INDEX - WriteIndex));
+			      added = true;
+			    }
+			else
+			    {
+			      cout<< "Writing normally";
+			      copy(response.begin(),response.end(),chbuffer + WriteIndex);
+			      setWriteIndex(WriteIndex + response.length());
+			      added = true;
+			    }
+		    }
+		else
+		    {
+		      cout << "Not enough buffer space available, waiting for reader to advance\n";
+		    }
+	    }
+    }
+
+  int getBytesAvailable()
+    {
+	ReadIndex = getReadIndex();
+	if(WriteIndex > ReadIndex)
+	    {
+		return BUFFER_SIZE - (WriteIndex - ReadIndex);
+	    }
+	else if(WriteIndex < ReadIndex)
+	    {
+		return ReadIndex - WriteIndex;
+	    }
+	else return BUFFER_SIZE;
+    }
+  
+  int getWriteIndex()
+  {
+    return getSizeFromBuffer(chbuffer, 0);
+  }
+  int getReadIndex()
+  {
+    return getSizeFromBuffer(chbuffer, 4);
+  }
+  
+};
+
+void createColumnFamily(string name){
   ColumnFamilyHandle* cf;
   Status s = db->CreateColumnFamily(ColumnFamilyOptions(), name, &cf);
   assert(s.ok());
-  COLUMN_FAMILIES.insert(std::pair<std::string,ColumnFamily>(name,ColumnFamily(cf,ColumnFamilyOptions()) ) );
+  COLUMN_FAMILIES.insert(pair<string,ColumnFamily>(name,ColumnFamily(cf,ColumnFamilyOptions()) ) );
 }
 
 
 void saveColumnFamilyNames(){
-  std::ofstream myfile ("/home/deividas/cfnames");
+  ofstream myfile ("/home/deividas/cfnames");
   
   if (myfile.is_open())
     {
       myfile << kDefaultColumnFamilyName + "\n";
-      for (std::map<std::string, ColumnFamily>::iterator it= COLUMN_FAMILIES.begin(); it!=COLUMN_FAMILIES.end(); ++it){
+      for (map<string, ColumnFamily>::iterator it= COLUMN_FAMILIES.begin(); it!=COLUMN_FAMILIES.end(); ++it){
 	myfile << it->first + "\n";
    }
       myfile.close();
     }
 }
 
-int insert(std::string table, std::string key,std::string values) {
+int insert(string table, string key,string values) {
     if (COLUMN_FAMILIES.find(table) == COLUMN_FAMILIES.end()) {
-      std::cout<<"Creating new column family " + table + "\n";
+    if(debug)  cout<<"Creating new column family " + table + "\n";
       createColumnFamily(table);
-      std::cout<<"Created \n";
     }
     ColumnFamilyHandle * cf = COLUMN_FAMILIES.find(table)->second.getHandle();
-    //  std::cout<<"Handle achieved\n";
+    //  cout<<"Handle achieved\n";
     Status s = db->Put(WriteOptions(),cf, Slice(key), Slice(values));
     if(s.ok()){saveColumnFamilyNames(); return 0;}
     else return -1;
   }
 
+int update(string table, string key,string values) {
+  if (COLUMN_FAMILIES.find(table) == COLUMN_FAMILIES.end()) {
+    if(debug)  cout<<"Creating new column family " + table + "\n";
+      createColumnFamily(table);
+    }
+    ColumnFamilyHandle * cf = COLUMN_FAMILIES.find(table)->second.getHandle();
+    //  cout<<"Handle achieved\n";
+    string current_values;
+    map<string, string> current_values_map;
+    map<string, string> values_map;
+    //cout<<"Getting values from database"<< endl;
+    Status s = db->Get(ReadOptions(), cf, Slice(key), &current_values);
+    // if(!s.ok()) return -1;
+     set<string> empty;
+     deserializeValues(current_values, empty, current_values_map);
+     deserializeValues(values, empty,values_map);
 
-int delete_record(std::string table, std::string key) {
+     current_values_map.insert(values_map.begin(),values_map.end());
+    
+     s = db->Put(WriteOptions(),cf, Slice(key), Slice(serializeValues(current_values_map)));
+     if(s.ok()){saveColumnFamilyNames(); return 0;}
+     else return -1;
+  }
+
+map<string, string> scan(string table, string startkey, int iterations,set<string> fields) {
+    if (COLUMN_FAMILIES.find(table) == COLUMN_FAMILIES.end()) {
+    createColumnFamily(table);
+    }
+    
+    ColumnFamilyHandle * cf = COLUMN_FAMILIES.find(table)->second.getHandle();
+
+    map<string, string> result;
+    int itercount = 0;
+   if(debug) cout<<"Iterations: " <<iterations<<endl;
+   if(debug)cout<<"startkey: " <<startkey<<endl;
+    rocksdb::Iterator* it = db->NewIterator(rocksdb::ReadOptions());
+    for (it->Seek(startkey); it->Valid() && itercount < iterations; it->Next()) {
+    if(debug)  cout<<"Seeking"<<endl;
+      map<string, string> record;
+      deserializeValues(it->value().ToString(), fields, record);
+      //    cout<<recordfirst()<<endl;
+      result.insert(record.begin(),record.end());
+      itercount++;
+    }
+    assert(it->status().ok()); // Check for any errors found during the scan
+    delete it;
+    
+    return result;
+}
+
+
+
+int delete_record(string table, string key) {
 
   if (COLUMN_FAMILIES.find(table) == COLUMN_FAMILIES.end()) {
     createColumnFamily(table);
@@ -100,25 +352,31 @@ int delete_record(std::string table, std::string key) {
 }
   
 
-std::string read(std::string table, std::string key) {
+string read(string table, string key) {
       if (COLUMN_FAMILIES.find(table) == COLUMN_FAMILIES.end()) {
       createColumnFamily(table);
       }
 
       ColumnFamilyHandle * cf = COLUMN_FAMILIES.find(table)->second.getHandle();
-      std::string values;
+      string values;
+      //string values;
+    if(debug)  cout<<"Getting values from database"<< endl;
       Status s = db->Get(ReadOptions(), cf, Slice(key), &values);
-      if(s.ok())return values;
-      else return std::string("");
+      if(s.ok()){
+if(debug)cout<<"is ok"<<endl;
+	//cout<<"value size "<<values.ToString().length() <<endl;
+	return values;
+      }
+      else return string("");
   }
 
-std::string kDBPath = "/home/deividas/rocksdb-data";
+string kDBPath = "/home/deividas/rocksdb-data";
 
 
-std::vector<std::string> loadColumnFamilyNames(){
-  std::string line;
-  std::vector<std::string> res; 
-  std::ifstream myfile ("/home/deividas/cfnames");
+vector<string> loadColumnFamilyNames(){
+  string line;
+  vector<string> res; 
+  ifstream myfile ("/home/deividas/cfnames");
   if (myfile.is_open())
   {
     while ( getline (myfile,line) )
@@ -132,112 +390,249 @@ std::vector<std::string> loadColumnFamilyNames(){
 
 
 
-unsigned int getSizeFromBuffer(std::vector<char> buffer,int index)
+int getSizeFromBuffer(vector<char> buffer,int index)
 {
   //return *reinterpret_cast<unsigned int*>(buffer.data() + index);
-  return ((unsigned int)buffer[index] << 24 | (unsigned int)buffer[index+1] << 16 | (unsigned int)buffer[index+2] << 8 | (unsigned int)buffer[index+3]);
+  //cout<<"last octet: " <<int((unsigned char)buffer[index+3]) <<endl;
+  int size = int( (unsigned char)(buffer[index]) << 24 | (unsigned char)(buffer[index+1]) << 16 | (unsigned char)(buffer[index+2]) << 8 | (unsigned char)(buffer[index+3]) ); 
+  return size;
 }
 
-char * parseRequest(std::vector<char> buffer)
+
+int getSizeFromBuffer(string buffer,int index)
 {
-  std::cout<<"PARSING REQUEST"<<std::endl;
+  //return *reinterpret_cast<unsigned int*>(buffer.data() + index);
+  //cout<<"last octet: " <<int((unsigned char)buffer[index+3]) <<endl;
+  int size = int( (unsigned char)(buffer[index]) << 24 | (unsigned char)(buffer[index+1]) << 16 | (unsigned char)(buffer[index+2]) << 8 | (unsigned char)(buffer[index+3]) ); 
+  return size;
+}
+
+int getSizeFromBuffer(char * buffer,int index)
+{
+  //return *reinterpret_cast<unsigned int*>(buffer.data() + index);
+  //cout<<"last octet: " <<int((unsigned char)buffer[index+3]) <<endl;
+  int size = int( (unsigned char)(buffer[index]) << 24 | (unsigned char)(buffer[index+1]) << 16 | (unsigned char)(buffer[index+2]) << 8 | (unsigned char)(buffer[index+3]) ); 
+  return size;
+}
+void deserializeValues(string values, set<string> fields, map<string, string> &result) {
+
+    int offset = 0;
+    while(offset < values.length()) {
+      int keyLen = getSizeFromBuffer(values,offset);
+    if(debug)  cout<<"DETECTED KEYLENGTH "  << keyLen<<endl;
+      offset += 4;
+      string key =  string(&values[0] + offset, &values[0] + offset + keyLen);
+     if(debug) cout<<"DETECTED KEY "  << key<<endl;
+      offset += keyLen;
+      int valueLen = getSizeFromBuffer(values,offset);
+    if(debug)  cout<<"DETECTED VALUE LENGTH "  << valueLen<<endl;
+      offset += 4;
+      string value =  string(&values[0] + offset, &values[0] + offset + valueLen);
+     if(debug) cout<<"DETECTED VALUE "  << value<<endl;
+      offset += valueLen;
+
+      if(fields.size() == 0 || fields.find(key) !=fields.end()) {
+	result.insert ( pair<string,string>(key,value) );
+       }
+    }
+  }
+
+vector<unsigned char> intToBytes(int paramInt)
+{
+  vector<unsigned char> arrayOfByte(4);
+  for (int i = 0; i < 4; i++)
+    arrayOfByte[3 - i] = (paramInt >> (i * 8));
+  return arrayOfByte;
+}
+
+string serializeValues( map<string, string> values) {
+  string result;
+  map<string,string>::iterator it;
+  for ( it = values.begin(); it != values.end(); it++ ) {
+    vector<unsigned char> keyLength_v = intToBytes(it->first.length()); 
+    string keyLength = string(keyLength_v.begin(), keyLength_v.end());
+    vector<unsigned char> valueLength_v = intToBytes(it->second.length()); 
+    string valueLength = string(valueLength_v.begin(), valueLength_v.end());
+    result+= keyLength + it->first + valueLength + it->second;
+  }
+  return result;
+    
+}
+
+
+string parseRequest(vector<char> buffer)
+{
+if(debug)  cout<<"PARSING REQUEST"<<endl;
   if(buffer.size() > 0)
     {
-      std::cout<<"buffer accepted"<<std::endl;
+   if(debug)   cout<<"buffer accepted"<<endl;
       if(buffer[0] == 'I')
 	{
 	  int currIndex = 1;
-	  std::cout<<"INSERT"<<std::endl;
-	  unsigned int size = getSizeFromBuffer(buffer,currIndex);
+	if(debug)  cout<<"INSERT"<<endl;
+	  int size = getSizeFromBuffer(buffer,currIndex);
 	  currIndex+=4;
-	  std::cout<<"size "<< size<<std::endl;
-	  std::string table(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
-	  std::cout<<table<<std::endl;
+	  if(debug)cout<<"size "<< size<<endl;
+	  string table(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	 if(debug) cout<<table<<endl;
 	  currIndex +=size;
 	  
 	  size = getSizeFromBuffer(buffer,currIndex);
 	  currIndex+=4;
-	  std::cout<<"size "<< size<<std::endl;
-	  std::string key(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
-	  std::cout<<key<<std::endl;
+	 if(debug) cout<<"size "<< size<<endl;
+	  string key(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	  if(debug)cout<<key<<endl;
 	  currIndex +=size;
 
 	  size = getSizeFromBuffer(buffer,currIndex);
 	  currIndex+=4;
-	  std::cout<<"size "<< size<<std::endl;
-	  std::string values(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
-	  std::cout<<values<<std::endl;
+	 if(debug) cout<<"size "<< size<<endl;
+	  string values(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	 if(debug) cout<<values<<endl;
 	  currIndex +=size;
-	  //  std::cout<< "reached 1\n";
+	  //  cout<< "reached 1\n";
 	  
 	  const char *cstr = values.c_str();
-	  //  std::cout<< "converted str\n";
+	  //  cout<< "converted str\n";
 	  int res = insert(table,key,values);
-	  //	  std::cout<< "inserted\n";
-	  if(res == 0)return "OK\n";
-	  else return "ER\n";	  
+	  //	  cout<< "inserted\n";
+	  if(res == 0)return "OK";
+	  else return "ER";	  
 	}
       else if(buffer[0] == 'D')
 	{
 	  int currIndex = 1;
-	  std::cout<<"DELETE"<<std::endl;
+	 if(debug) cout<<"DELETE"<<endl;
 	  unsigned int size = getSizeFromBuffer(buffer,currIndex);
 	  currIndex+=4;
-	  std::cout<<"size "<< size<<std::endl;
-	  std::string table(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
-	  std::cout<<table<<std::endl;
+	 if(debug) cout<<"size "<< size<<endl;
+	  string table(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	 if(debug) cout<<table<<endl;
 	  currIndex +=size;
 	  
 	  size = getSizeFromBuffer(buffer,currIndex);
 	  currIndex+=4;
-	  std::cout<<"size "<< size<<std::endl;
-	  std::string key(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
-	  std::cout<<key<<std::endl;
+	 if(debug) cout<<"size "<< size<<endl;
+	  string key(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	 if(debug) cout<<key<<endl;
 	  currIndex +=size;
-
 	  int res = delete_record(table,key);
-	  if(res == 0)return "OK\n";
-	  else return "ER\n";	  
+	  if(res == 0){if(debug)cout<<"Deleted successfully "<<endl;return "OK";}
+	  else return "ER";	  
 	}
       else if(buffer[0] == 'R')
 	{
 	  int currIndex = 1;
-	  std::cout<<"READ"<<std::endl;
+	 if(debug) cout<<"READ"<<endl;
 	  unsigned int size = getSizeFromBuffer(buffer,currIndex);
 	  currIndex+=4;
-	  std::cout<<"size "<< size<<std::endl;
-	  std::string table(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
-	  std::cout<<table<<std::endl;
+	 if(debug) cout<<"size "<< size<<endl;
+	  string table(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	  if(debug)cout<<table<<endl;
 	  currIndex +=size;
 	  
 	  size = getSizeFromBuffer(buffer,currIndex);
 	  currIndex+=4;
-	  std::cout<<"size "<< size<<std::endl;
-	  std::string key(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
-	  std::cout<<key<<std::endl;
+	  if(debug)cout<<"size "<< size<<endl;
+	  string key(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	  if(debug)cout<<key<<endl;
 	  currIndex +=size;
 
-	  std::string res = read(table,key);
-	  std::string ret = "OK" + res + "\n";
-	  char final_ret[ret.size()+1];
-	  strcpy(final_ret,ret.c_str());
-	  if(res != "") return final_ret;
-	  else return "ER\n";	  
+	  string res = read(table,key);
+	  if(debug)cout<<"the value is " <<res <<endl;
+	  auto * c = res.c_str();
+	  //	  for (auto i = 0U; i < res.length(); ++i) {
+	  // cout << hex << +c[i] << ' ' <<dec;
+	  //}
+	  string ret = "OK" + res;
+	  if(res != "") return ret;
+	  else return "ER";	  
+	}
+      else if(buffer[0] == 'U')
+	{
+	  int currIndex = 1;
+	 if(debug) cout<<"UPDATE"<<endl;
+	  int size = getSizeFromBuffer(buffer,currIndex);
+	  currIndex+=4;
+	  if(debug)cout<<"size "<< size<<endl;
+	  string table(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	if(debug)  cout<<table<<endl;
+	  currIndex +=size;
+	  
+	  size = getSizeFromBuffer(buffer,currIndex);
+	  currIndex+=4;
+	 if(debug) cout<<"size "<< size<<endl;
+	  string key(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	if(debug)  cout<<key<<endl;
+	  currIndex +=size;
+
+	  size = getSizeFromBuffer(buffer,currIndex);
+	  currIndex+=4;
+	 if(debug) cout<<"size "<< size<<endl;
+	  string values(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	  if(debug)cout<<values<<endl;
+	  currIndex +=size;
+	  //  cout<< "reached 1\n"
+	  //  cout<< "converted str\n";
+	  int res = update(table,key,values);
+	  //	  cout<< "updated\n";
+	  if(res == 0)return "OK";
+	  else return "ER";	  
+	}
+
+      else if(buffer[0] == 'S')
+	{
+	  int currIndex = 1;
+	 if(debug) cout<<"SCAN"<<endl;
+	  int size = getSizeFromBuffer(buffer,currIndex);
+	  currIndex+=4;
+	 if(debug) cout<<"size "<< size<<endl;
+	  string table(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	  if(debug)cout<<table<<endl;
+	  currIndex +=size;
+	  
+	  size = getSizeFromBuffer(buffer,currIndex);
+	  currIndex+=4;
+	  if(debug)cout<<"size "<< size<<endl;
+	  string startkey(buffer.begin() + currIndex,buffer.begin() + currIndex + size );
+	if(debug)  cout<<startkey<<endl;
+	  currIndex +=size;
+	  
+	  int recordcount = getSizeFromBuffer(buffer,currIndex);
+	  currIndex+=4;
+	  int fieldsize = getSizeFromBuffer(buffer,currIndex);
+	  currIndex+=4;
+
+	  set<string> fields;
+	  for(int i = 0;i < fieldsize; i++)
+	    {
+	      int fieldlength =  getSizeFromBuffer(buffer,currIndex);
+	      currIndex+=4;
+	      string field(buffer.begin() + currIndex,buffer.begin() + currIndex + fieldlength );
+	     if(debug) cout<<"Field: " << field<<endl;
+	      fields.insert(field);
+	      currIndex +=fieldlength;	      
+	    }
+	 
+	  map<string, string> result = scan(table,startkey,recordcount ,fields);
+	  //	  cout<< "scan finished\n";
+	  return "OK" + serializeValues(result) + "";
+	  //else return "ER\n";	  
 	}
       
     }
-  else return "ER\n";
+  else return "ER";
 }
 
 int main(int argc , char *argv[]) 
 {
-  std::vector<ColumnFamilyDescriptor> column_families;
-  std::vector<std::string> cfnames = loadColumnFamilyNames();
+  vector<ColumnFamilyDescriptor> column_families;
+  vector<string> cfnames = loadColumnFamilyNames();
   //for (auto & it : cfnames)
   for (auto it= cfnames.begin(); it!=cfnames.end(); ++it){
     column_families.push_back(ColumnFamilyDescriptor(*it, ColumnFamilyOptions()));
    }
-  std::vector<ColumnFamilyHandle*> handles;
+  vector<ColumnFamilyHandle*> handles;
   Options options;
   options.create_if_missing = true;
   options.create_missing_column_families = true;
@@ -246,12 +641,41 @@ int main(int argc , char *argv[])
   assert(s.ok());
   
   for(int i = 0; i < cfnames.size(); i++) {
-    COLUMN_FAMILIES.insert(std::pair<std::string,ColumnFamily>(cfnames[i], ColumnFamily(handles[i], ColumnFamilyOptions()) ) );
+    COLUMN_FAMILIES.insert(pair<string,ColumnFamily>(cfnames[i], ColumnFamily(handles[i], ColumnFamilyOptions()) ) );
   }
 
+  insert("test", "0", "abc");
   
+  // setup is done
+  
+  MMappedBuffer req("req_buffer");
+  MMappedBuffer resp("resp_buffer");
 
-  // for (std::map<std::string,ColumnFamily>::iterator it= COLUMN_FAMILIES.begin(); it!=COLUMN_FAMILIES.end(); ++it)
+  while(true)
+    {
+      vector<char> request = req.readNext();
+      cout<< "Request size " << request.size()<< endl;
+      cout<< "request: \n";
+      
+      for (int i = 0;i< request.size();i++)
+	cout << request[i];
+      
+      if(request.size() > 0)
+	{
+	  cout<<"parsing"<<endl;
+	  string response = parseRequest(request);
+	  vector<unsigned char> msg_length = intToBytes(response.length()); 
+	  string msgLength = string(msg_length.begin(), msg_length.end());
+	  string final_response = msgLength + response;
+	  cout<<"sending final response " << final_response <<endl;
+	  resp.addToBuffer(final_response);
+	  }
+    }
+  //  for (auto a = request.begin(); a != request.end(); ++a)
+    return 0;
+}
+  /*
+  // for (map<string,ColumnFamily>::iterator it= COLUMN_FAMILIES.begin(); it!=COLUMN_FAMILIES.end(); ++it)
   // delete it->second.getHandle();
   
   //  delete db;
@@ -263,10 +687,10 @@ int main(int argc , char *argv[])
   struct sockaddr_in address; 
   
   char buffer[1025]; //data buffer of 1K 
-  std::vector<char> buffers[max_clients];
+  vector<char> buffers[max_clients];
 	//set of socket descriptors 
-  fd_set readfds; 
-		
+  fd_set readfds;
+	
 	
 	//initialise all client_socket[] to 0 so not checked 
 	for (i = 0; i < max_clients; i++) 
@@ -399,38 +823,61 @@ int main(int argc , char *argv[])
 					getpeername(sd , (struct sockaddr*)&address ,(socklen_t*)&addrlen); 
 					printf("Host disconnected , ip %s , port %d \n" , 
 						inet_ntoa(address.sin_addr) , ntohs(address.sin_port)); 
-					std::cout<<"Closing socket\n";
+					cout<<"Closing socket\n";
 					//Close the socket and mark as 0 in list for reuse 
 					close( sd ); 
 					client_socket[i] = 0; 
 				} 
 					
 				else if(valread == -1){
-				  printf("Unexpected disconnect\n");
+				  printf("Weird disconnect\n");
 				    close( sd ); 
 				    client_socket[i] = 0;  
 				  }
 				else {
 
-				  std::cout<<"valread\n" <<valread<< "\n";
+				if(debug)  cout<<"valread " <<valread<< "\n";
 				  buffers[i].insert(buffers[i].end(),buffer,buffer+valread);
-				  std::cout<<"inserted\n";
-				  char * response;
+				if(debug) cout<<"inserted\n";
+				  string response;
 				  if(valread < 1024) { // if exact size, what then?
-				      std::cout<<"Request complete:"<<std::endl;
-				       for (auto a = buffers[i].begin(); a != buffers[i].end(); ++a)
-					 std::cout << *a;
+				    if(debug)  cout<<"Request complete:"<<endl;
+				    //   for (auto a = buffers[i].begin(); a != buffers[i].end(); ++a)
+				    //	 cout << *a;
 				       response = parseRequest(buffers[i]);
 				       buffers[i].clear();
 				   }
-				 
+				  //char * response_pointer = new char[response.size() + 1 ];
+				  //response.copy(response_pointer, response.length());
+				  //strcpy(response_pointer, response.c_str() + 3);
+				  //strcpy(response_pointer, response.c_str());
+				  // response.data();
+				  vector<unsigned char> msg_length = intToBytes(response.length()); 
+				  string msgLength = string(msg_length.begin(), msg_length.end());
+				  
+				  string final_response = msgLength + response;
+				  char * response_pointer = &final_response[0];
+			if(debug)	  cout<<"sending response "<<response_pointer<< endl;
+			if(debug)	  cout<<"response in string format: "<<response<< endl;
+			if(debug)	  cout<<"strlen " << response.length() <<endl;
+				  
 				    // printf("received: \n");
 				    //printf("%s",(char*)buffer);
-				  send(sd , response , strlen(response) , 0 );
-				} 
+				  int bytesSent = 0; 
+				  while(bytesSent < final_response.length())
+				    {
+				      int bytesToSend = final_response.length() - bytesSent;
+				   if(debug)   cout<<"Bytes to send " << bytesToSend <<endl;
+				      if(bytesToSend > 1024) bytesToSend = 1024;
+				      send(sd , response_pointer + bytesSent , bytesToSend , 0 );
+				      bytesSent += bytesToSend;
+				    }
+				  //  delete[] response_pointer;
+				}
 			} 
 		} 
 	} 
 		
 	return 0; 
 } 
+*/
