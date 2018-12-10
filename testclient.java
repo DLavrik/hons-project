@@ -1,51 +1,133 @@
-import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileChannel.MapMode;
+import java.nio.CharBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.nio.MappedByteBuffer;
+import java.nio.ByteBuffer;
 import java.io.*;
-import java.io.PrintWriter;
-import java.net.InetAddress;
-import java.net.Socket;
-import java.util.Scanner;
+
+// bytes 0-4 is write index
+// bytes 4-8 is read index
+
 public class testclient {
-    private Socket socket;
-    private Scanner scanner;
-        private Scanner scanner2;
-    private BufferedReader in;
-    private testclient(InetAddress serverAddress, int serverPort) throws Exception {
-        this.socket = new Socket(serverAddress, serverPort);
-        this.scanner = new Scanner(System.in);
-	this.scanner2 = new Scanner(this.socket.getInputStream());
-	this.in = new BufferedReader(new InputStreamReader(this.socket.getInputStream()));
+    private static MappedByteBuffer req_b;
+    private static MappedByteBuffer resp_b;
+    private static int WriteIndex;
+    private static int ReadIndex;
+    private static int BufferSize;
+    private static int BufferStartIndex;
+
+    public static void main( String[] args ) throws Throwable {
+	BufferSize = 20;
+	BufferStartIndex = 8;
+
 	
+        File req_f = new File("req_buffer");
+	File resp_f = new File("resp_buffer");
+	ByteArrayOutputStream message = new ByteArrayOutputStream();
+	ByteArrayOutputStream fullMessage = new ByteArrayOutputStream();
+        FileChannel req_channel = FileChannel.open( req_f.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE );
+	FileChannel resp_channel = FileChannel.open( resp_f.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE );
+
+        req_b = req_channel.map( MapMode.READ_WRITE, 0, BufferSize + BufferStartIndex);
+	resp_b = resp_channel.map( MapMode.READ_WRITE, 0 , BufferSize + BufferStartIndex);
+	req_b.position(BufferStartIndex);
+	resp_b.position(BufferStartIndex);
+	updateReadIndex(BufferStartIndex);
+	updateWriteIndex(BufferStartIndex);	
+
+	message.write("R".getBytes(),0,1);
+	message.write(deconstructNumber(4));
+	message.write("test".getBytes(),0,4);
+	message.write(deconstructNumber(1));
+	message.write("0".getBytes(),0,1);
+	fullMessage.write(deconstructNumber(message.toByteArray().length),0,4);
+	message.writeTo(fullMessage);
+	//for(int i = 0;i<1;i++)
+	while(true)
+	    {
+		addToBuffer(fullMessage.toByteArray());
+	    }
+
     }
-    private void start() throws IOException {
-        String input;
-	String inputLine;
-        while (true) {
-            input = scanner.nextLine();
-            PrintWriter out = new PrintWriter(this.socket.getOutputStream(), true);
-            out.println("I"+ deconstructNumber(2) + "aa" +deconstructNumber(1) + "1" + deconstructNumber(5) + "aaaaa");
-            out.flush();
-	    //inputLine = scanner2.nextLine();
-	    //System.out.println("GOT " + inputLine);
-	    while ((inputLine = in.readLine()) != null) {
-	    	System.out.println("GOT " + inputLine);
-	    	break;
-	 	}
-        }
-    }
-    private String deconstructNumber(int n)
+    private static  byte[] deconstructNumber(int n)
     {
-	byte first =(byte)( (n >> 24 )& 0xFF);
-	byte second = (byte)((n >> 16) & 0xFF);
-	byte third =(byte)( (n >> 8 )& 0xFF);
-	byte fourth = (byte)(n & 0xFF);
-	return "" + (char)first + (char)second + (char)third + (char)fourth;
+	byte[] bytes = ByteBuffer.allocate(4).putInt(n).array();
+	return bytes;
     }
-    public static void main(String[] args) throws Exception {
-        testclient client = new testclient(
-                InetAddress.getByName(args[0]), 
-                Integer.parseInt(args[1]));
-        
-        System.out.println("\r\nConnected to Server: " + client.socket.getInetAddress());
-        client.start();                
+    private static void addToBuffer(byte[] byteArray)
+    // writes byteArray starting at position WriteIndex, overlaps if reaches end of buffer
+	
+    {
+	boolean added = false;
+	while(!added)
+	    {
+		int bytesAvailable = getBytesAvailable();
+		System.out.println("Bytes available: " + bytesAvailable + " \n");
+		if(bytesAvailable >= byteArray.length)
+		    {
+			if(BufferSize + BufferStartIndex - WriteIndex <= byteArray.length) // need to overlap
+			    {
+				System.out.println("Splitting \n");
+				req_b.put(byteArray,0, BufferSize + BufferStartIndex - WriteIndex);
+				
+				req_b.position(BufferStartIndex); // reset position to the beginning
+				req_b.put(byteArray,BufferSize + BufferStartIndex - WriteIndex, byteArray.length - (BufferSize + BufferStartIndex - WriteIndex));
+				updateWriteIndex(BufferStartIndex + byteArray.length - (BufferSize + BufferStartIndex - WriteIndex));
+				added = true;
+			    }
+			else
+			    {
+				System.out.println("Writing normally");
+				req_b.put(byteArray,0, byteArray.length);
+				updateWriteIndex(WriteIndex + byteArray.length);
+				added = true;
+			    }
+		    }
+		else
+		    {
+			System.out.println("Not enough buffer space available, waiting for reader to advance");
+		    }
+	    }
+    }
+    private static int getBytesAvailable()
+    {
+	ReadIndex = getReadIndex();
+	if(WriteIndex > ReadIndex)
+	    {
+		return BufferSize - (WriteIndex - ReadIndex);
+	    }
+	else if(WriteIndex < ReadIndex)
+	    {
+		return ReadIndex - WriteIndex;
+	    }
+	else return BufferSize;
+    }
+    private static void updateWriteIndex(int newIndex)
+    {
+	/*	if(newIndex >= BufferSize + BufferStartIndex)
+	    {
+		newIndex = BufferStartIndex;
+		}*/
+	WriteIndex = newIndex;
+	int prevPosition = req_b.position();
+	req_b.position(0);
+	req_b.put(deconstructNumber(newIndex));
+	req_b.position(prevPosition);
+    }
+    
+    private static void updateReadIndex(int newIndex)
+    {
+	ReadIndex = newIndex;
+	int prevPosition = req_b.position();
+	req_b.position(4);
+	req_b.put(deconstructNumber(newIndex));
+	req_b.position(prevPosition);
+    }
+
+    private static int getReadIndex()
+    {
+	return req_b.getInt(4);
     }
 }
