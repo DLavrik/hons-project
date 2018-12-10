@@ -38,6 +38,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.util.Scanner;
+import java.nio.ByteBuffer;
 /**
  * RocksDB binding for <a href="http://rocksdb.org/">RocksDB</a>.
  *
@@ -47,7 +48,10 @@ public class RocksDBClient extends DB {
 
   private Socket socket;
   private BufferedReader in;
-  private PrintWriter out;
+  private DataInputStream is;
+  private ByteArrayOutputStream message;
+  private DataOutputStream out;
+    private boolean debug;
   static final String PROPERTY_ROCKSDB_DIR = "rocksdb.dir";
   private static final String COLUMN_FAMILY_NAMES_FILENAME = "CF_NAMES";
 
@@ -66,8 +70,11 @@ public class RocksDBClient extends DB {
     synchronized(RocksDBClient.class) {
 	try{
 	    this.socket = new Socket(InetAddress.getByName("localhost"), 8888);
-	    in = new BufferedReader(new InputStreamReader(this.socket.getInputStream()));
-	    out = new PrintWriter(this.socket.getOutputStream(), true);
+	    message = new ByteArrayOutputStream();
+	    out = new DataOutputStream(this.socket.getOutputStream());
+	    //    in = new BufferedReader(new InputStreamReader(this.socket.getInputStream())); //bufferedinputstream
+	    is = new DataInputStream(this.socket.getInputStream());
+	    debug = true;
 	}catch(Exception e){}
 	
       if(rocksDb == null) {
@@ -176,13 +183,27 @@ public class RocksDBClient extends DB {
     }
   }
 
+
+    
   @Override
   public Status read(final String table, final String key, final Set<String> fields,
       final Map<String, ByteIterator> result) {
+      if(debug)   System.out.println("DOING READ");
        try{
-      out.println("R"+ deconstructNumber(table.length()) + table + deconstructNumber(key.length())+ key);
-      out.flush();
-      return GetResponse();
+	   message.write("R".getBytes(),0,1);
+	   message.write(deconstructNumber(table.length()));
+	   message.write(table.getBytes(),0,table.length());
+	   message.write(deconstructNumber(key.length()));
+	   message.write(key.getBytes(),0,key.length());
+	   out.write(message.toByteArray());
+	   message.reset();
+	   
+	   ByteArrayOutputStream response_msg = GetResponse();
+	   byte[] response_array = response_msg.toByteArray();
+	   byte[] raw_data = Arrays.copyOfRange(response_array, 2,response_array.length );
+	   if(debug)	   System.out.println(Arrays.toString(response_array));
+	   //deserializeValues(raw_data,fields,result);
+	   return getStatus(response_msg.toByteArray());
       } catch(IOException e) {return Status.ERROR;}
        //deserializeValues(values, fields, result);
        //return Status.OK;
@@ -191,99 +212,128 @@ public class RocksDBClient extends DB {
   @Override
   public Status scan(final String table, final String startkey, final int recordcount, final Set<String> fields,
         final Vector<HashMap<String, ByteIterator>> result) {
-      try {
-      if (!COLUMN_FAMILIES.containsKey(table)) {
-        createColumnFamily(table);
-      }
+     if(debug) System.out.println("DOING SCAN");
+      try{
+	  message.write("S".getBytes(),0,1);
+	  message.write(deconstructNumber(table.length()));
+	  message.write(table.getBytes(),0,table.length());
+	  message.write(deconstructNumber(startkey.length()));
+	  message.write(startkey.getBytes(),0,startkey.length());
+	  message.write(deconstructNumber(recordcount));
+	  message.write(deconstructNumber(fields.size()));
+	  for(String field : fields)
+	      {
+		  message.write(deconstructNumber(field.length()));
+		  message.write(field.getBytes(),0,field.length());
+	      }
+	  
+	  out.write(message.toByteArray());
+	  message.reset();
 
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      try(final RocksIterator iterator = rocksDb.newIterator(cf)) {
-        int iterations = 0;
-        for (iterator.seek(startkey.getBytes(UTF_8)); iterator.isValid() && iterations < recordcount;
-             iterator.next()) {
-          final HashMap<String, ByteIterator> values = new HashMap<>();
-          deserializeValues(iterator.value(), fields, values);
-          result.add(values);
-          iterations++;
-        }
-      }
-
-      return Status.OK;
-    } catch(final RocksDBException e) {
-      LOGGER.error(e.getMessage(), e);
-      return Status.ERROR;
-      }
+	  ByteArrayOutputStream response_msg = GetResponse();
+	  return getStatus(response_msg.toByteArray());
+      } catch(IOException e) {return Status.ERROR;}
   }
 
   @Override
   public Status update(final String table, final String key, final Map<String, ByteIterator> values) {
-    //TODO(AR) consider if this would be faster with merge operator
-      try {
-      if (!COLUMN_FAMILIES.containsKey(table)) {
-        createColumnFamily(table);
-      }
-
-      final ColumnFamilyHandle cf = COLUMN_FAMILIES.get(table).getHandle();
-      final Map<String, ByteIterator> result = new HashMap<>();
-      final byte[] currentValues = rocksDb.get(cf, key.getBytes(UTF_8));
-      if(currentValues == null) {
-        return Status.NOT_FOUND;
-      }
-      deserializeValues(currentValues, null, result);
-
-      //update
-      result.putAll(values);
-
-      //store
-      rocksDb.put(cf, key.getBytes(UTF_8), serializeValues(result));
-
-      return Status.OK;
-
-    } catch(final RocksDBException | IOException e) {
-      LOGGER.error(e.getMessage(), e);
-      return Status.ERROR;
-      }
+   if(debug)   System.out.println("DOING UPDATE");
+      try{
+	  byte[] serialised = serializeValues(values);
+	  if(debug)  System.out.println("size " + serialised.length);
+	  message.write("U".getBytes(),0,1);
+	  message.write(deconstructNumber(table.length()));
+	  message.write(table.getBytes(),0,table.length());
+	  message.write(deconstructNumber(key.length()));
+	  message.write(key.getBytes(),0,key.length());
+	  message.write(deconstructNumber(serialised.length));
+	  message.write(serialised,0,serialised.length);
+	  out.write(message.toByteArray());
+	  message.reset();
+	  ByteArrayOutputStream response_msg = GetResponse();
+	  return getStatus(response_msg.toByteArray());
+      } catch(IOException e) {return Status.ERROR;}
   }
 
-    String deconstructNumber(int n)
+    private byte[] deconstructNumber(int n)
     {
-	byte first =(byte)( (n >> 24 )& 0xFF);
-	byte second = (byte)((n >> 16) & 0xFF);
-	byte third =(byte)( (n >> 8 )& 0xFF);
-	byte fourth = (byte)(n & 0xFF);
-	return "" + (char)first + (char)second + (char)third + (char)fourth;
+	byte[] bytes = ByteBuffer.allocate(4).putInt(n).array();
+	return bytes;
     }
-    public Status GetResponse()throws IOException
+    public ByteArrayOutputStream GetResponse()throws IOException
     {
-	String inputLine;
-	String outputLine;
-	while ((inputLine = in.readLine()) != null) {
-	    if (inputLine.substring(0,2).equals("OK")){
-		return Status.OK;
-	    }
-	    else{
-		return Status.ERROR;
-	    }
+	int msg_size = is.readInt();
+if(debug)System.out.println("MSG LENGTH " + msg_size);
+	boolean finished = false;
+	int offset = 0;
+	int totalBytesRead = 0;
+	byte[] buffer = new byte[1024];
+	ByteArrayOutputStream result = new ByteArrayOutputStream();
+	while(!finished)
+	    {
+		int bytesRead = is.read(buffer,0,1024);
+		totalBytesRead += bytesRead;
+		if(debug)System.out.println("BYTES READ " + bytesRead);
+		if(debug)System.out.println("TOTAL BYTES READ " + totalBytesRead);
+		result.write(buffer, 0 , bytesRead);
+		if(totalBytesRead >= msg_size || bytesRead == -1) finished = true;
+		
+		if(debug)System.out.println("GOT " + new String(buffer));
+		}
+	    
+	    if(debug)System.out.println("FINAL RESULT " + result.toString());
+	    return result;
+    }
+
+    public Status getStatus(byte[] response)
+    {
+	if(debug)System.out.println("RESPONSE " + response);
+	if (response[0] == 'O'){
+	    if(debug)System.out.println("RETURNED OK");
+	    return Status.OK;
 	}
-	return Status.ERROR;
+	else{
+	    if(debug)System.out.println("RETURNED ERROR");
+	    return Status.ERROR;
+	}
     }
     
-  @Override
-  public Status insert(final String table, final String key, final Map<String, ByteIterator> values) {
-      try{
-	  String serialised = serializeValues(values).toString();
-	  out.println("I" + deconstructNumber(table.length()) + table + deconstructNumber(key.length())+ key + deconstructNumber(serialised.length())+ serialised);
-	  out.flush();
-	  return GetResponse();
+    @Override
+    public Status insert(final String table, final String key, final Map<String, ByteIterator> values) {
+	try{
+	    if(debug)System.out.println("DOING INSERT");
+	  byte[] serialised = serializeValues(values);
+	 if(debug) System.out.println("size " + serialised.length);
+	  message.write("I".getBytes(),0,1);
+	  message.write(deconstructNumber(table.length()));
+	  message.write(table.getBytes(),0,table.length());
+	  message.write(deconstructNumber(key.length()));
+	  message.write(key.getBytes(),0,key.length());
+	  message.write(deconstructNumber(serialised.length));
+	  message.write(serialised,0,serialised.length);
+	  out.write(message.toByteArray());
+	  message.reset();
+	  
+	  ByteArrayOutputStream response_msg = GetResponse();
+	if(debug)  System.out.println(Arrays.toString(response_msg.toByteArray()));
+	  return getStatus(response_msg.toByteArray());
       } catch(IOException e) {return Status.ERROR;}
   }
 
   @Override
   public Status delete(final String table, final String key) {
+      if(debug)System.out.println("DOING DELETE");
       try{
-      out.println("D" + deconstructNumber(table.length()) + table + deconstructNumber(key.length())+ key);
-      out.flush();
-      return GetResponse();
+	  message.write("D".getBytes(),0,1);
+	  message.write(deconstructNumber(table.length()));
+	  message.write(table.getBytes(),0,table.length());
+	  message.write(deconstructNumber(key.length()));
+	  message.write(key.getBytes(),0,key.length());
+	  out.write(message.toByteArray());
+	  message.reset();
+	  
+	  ByteArrayOutputStream response_msg = GetResponse();
+	  return getStatus(response_msg.toByteArray());
       } catch(IOException e) {return Status.ERROR;}
   }
 
@@ -350,13 +400,13 @@ public class RocksDBClient extends DB {
       for(final Map.Entry<String, ByteIterator> value : values.entrySet()) {
         final byte[] keyBytes = value.getKey().getBytes(UTF_8);
         final byte[] valueBytes = value.getValue().toArray();
-
+	//	System.out.println("KEYLENGTH " + keyBytes.length);
         buf.putInt(keyBytes.length);
         baos.write(buf.array());
         baos.write(keyBytes);
 
         buf.clear();
-
+	//	System.out.println("VALUE LENGTH " + valueBytes.length);
         buf.putInt(valueBytes.length);
         baos.write(buf.array());
         baos.write(valueBytes);
@@ -366,7 +416,7 @@ public class RocksDBClient extends DB {
       return baos.toByteArray();
     }
   }
-
+    
   private void createColumnFamily(final String name) throws RocksDBException {
     COLUMN_FAMILY_LOCKS.putIfAbsent(name, new ReentrantLock());
 
