@@ -30,8 +30,9 @@
 #include <sys/mman.h>
 #define TRUE 1 
 #define FALSE 0 
-#define BUFFER_SIZE 20
+#define BUFFER_SIZE 200
 #define BUFFER_START_INDEX 8
+#define ALLIGNMENT 4
 using namespace std;
 using namespace rocksdb;
 class ColumnFamily;
@@ -144,7 +145,7 @@ public:
   } 
 
   //int size = int( (unsigned char)(buffer[index]) << 24 | (unsigned char)(buffer[index+1]) << 16 | (unsigned char)(buffer[index+2]) << 8 | (unsigned char)(buffer[index+3]) ); 
-  
+  /*  
   int getIntFromBuffer(int index)
   {
     int nextAccessIndex = index;
@@ -164,36 +165,47 @@ public:
     setReadIndex(nextAccessIndex);
     return getSizeFromBuffer(temp,0);
   }
-  
+  */
+  void checkEndMark()
+  {
+    cout<<"READ index at check end mark " << ReadIndex <<" Write index " <<WriteIndex << endl;
+    if( (ReadIndex >= BUFFER_SIZE + BUFFER_START_INDEX) || (chbuffer[ReadIndex] == 0xFF))
+      {
+      setReadIndex(BUFFER_START_INDEX);
+      cout<<"RESETTING" <<endl;
+      }
+  }
+
+  int allign(int index)
+  {
+    int newIndex = index; 
+    if(index % ALLIGNMENT != 0)
+      newIndex = index + ALLIGNMENT - (index % ALLIGNMENT);
+    return newIndex; 
+  }
   
   vector<char> readNext()
   {
     vector<char> result;
     WriteIndex = getWriteIndex();
+    checkEndMark();
     if(ReadIndex != WriteIndex)      
       {// this means we have some data to read
        // first we have to get the next request in vector form
 	cout<<"Found unread data, write index: "<< WriteIndex << " , Read Index: " << ReadIndex <<endl;
-	int msgSize = getIntFromBuffer(ReadIndex);
+	//exit(EXIT_FAILURE);
+	int msgSize = getSizeFromBuffer(chbuffer, ReadIndex);
+	setReadIndex(ReadIndex + 4);
 	cout<<"Message Size " << msgSize << endl;
-	int bytesToReadTillEndOfBuffer = BUFFER_SIZE + BUFFER_START_INDEX - ReadIndex;
-	cout<< "Bytes to read till end of buffer: " << bytesToReadTillEndOfBuffer << endl;
-	if(bytesToReadTillEndOfBuffer <= msgSize)
-	  {
-	    cout<<"Spliting data to be read \n";
-	    result.assign(chbuffer + ReadIndex, chbuffer + ReadIndex + bytesToReadTillEndOfBuffer);
-	    result.insert(result.end(),chbuffer + BUFFER_START_INDEX, chbuffer + BUFFER_START_INDEX + msgSize - bytesToReadTillEndOfBuffer);
-	    setReadIndex(BUFFER_START_INDEX + msgSize - bytesToReadTillEndOfBuffer);
-	  }
-	else
-	  {
-	    cout<<"Reading normally \n";
-	    result.assign(chbuffer + ReadIndex, chbuffer + ReadIndex + msgSize);
-	    setReadIndex(ReadIndex + msgSize);
-	  }
+	
+	result.assign(chbuffer + ReadIndex, chbuffer + ReadIndex + msgSize);
+	setReadIndex(ReadIndex + allign(msgSize));
+	  
 	return result;
       }
-    // else cout<<"Nothing to read \n";
+    else{
+      //  cout<<"Nothing to read, read index " << ReadIndex <<endl;
+    }
   }
 
   void addToBuffer(string response)
@@ -654,12 +666,13 @@ int main(int argc , char *argv[])
   while(true)
     {
       vector<char> request = req.readNext();
-      cout<< "Request size " << request.size()<< endl;
-      cout<< "request: \n";
+      sleep(1);
+      //    cout<< "Request size " << request.size()<< endl;
+      //cout<< "request: \n";
       
       for (int i = 0;i< request.size();i++)
 	cout << request[i];
-      
+      /*
       if(request.size() > 0)
 	{
 	  cout<<"parsing"<<endl;
@@ -670,6 +683,7 @@ int main(int argc , char *argv[])
 	  cout<<"sending final response " << final_response <<endl;
 	  resp.addToBuffer(final_response);
 	  }
+      */
     }
   //  for (auto a = request.begin(); a != request.end(); ++a)
     return 0;

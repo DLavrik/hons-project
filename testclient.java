@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.MappedByteBuffer;
 import java.nio.ByteBuffer;
+import java.util.concurrent.TimeUnit;
 import java.io.*;
 
 // bytes 0-4 is write index
@@ -17,11 +18,14 @@ public class testclient {
     private static int ReadIndex;
     private static int BufferSize;
     private static int BufferStartIndex;
+    private static int ALLIGNMENT;
+    private static boolean endOfBufferFlag;
 
     public static void main( String[] args ) throws Throwable {
-	BufferSize = 20;
+	BufferSize = 200;
 	BufferStartIndex = 8;
-
+	ALLIGNMENT = 4;
+	endOfBufferFlag = true;
 	
         File req_f = new File("req_buffer");
 	File resp_f = new File("resp_buffer");
@@ -48,6 +52,7 @@ public class testclient {
 	while(true)
 	    {
 		addToBuffer(fullMessage.toByteArray());
+		TimeUnit.SECONDS.sleep(1);
 	    }
 
     }
@@ -56,65 +61,95 @@ public class testclient {
 	byte[] bytes = ByteBuffer.allocate(4).putInt(n).array();
 	return bytes;
     }
-    private static void addToBuffer(byte[] byteArray)
-    // writes byteArray starting at position WriteIndex, overlaps if reaches end of buffer
-	
+
+    private static int allign(int index)
+    {
+	int newIndex = index; 
+	if(index % ALLIGNMENT != 0)
+	    newIndex = index + ALLIGNMENT - (index % ALLIGNMENT);
+	return newIndex; 
+    }
+    
+    private static void addToBuffer(byte[] byteArray) throws InterruptedException	
     {
 	boolean added = false;
 	while(!added)
 	    {
 		int bytesAvailable = getBytesAvailable();
-		System.out.println("Bytes available: " + bytesAvailable + " \n");
-		if(bytesAvailable >= byteArray.length)
+		int allignedBytesAvailable = bytesAvailable - (bytesAvailable % ALLIGNMENT);
+		int bytesNeeded = allign(byteArray.length);
+		if(allignedBytesAvailable >= bytesNeeded) // we can write to buffer
 		    {
-			if(BufferSize + BufferStartIndex - WriteIndex <= byteArray.length) // need to overlap
-			    {
-				System.out.println("Splitting \n");
-				req_b.put(byteArray,0, BufferSize + BufferStartIndex - WriteIndex);
-				
-				req_b.position(BufferStartIndex); // reset position to the beginning
-				req_b.put(byteArray,BufferSize + BufferStartIndex - WriteIndex, byteArray.length - (BufferSize + BufferStartIndex - WriteIndex));
-				updateWriteIndex(BufferStartIndex + byteArray.length - (BufferSize + BufferStartIndex - WriteIndex));
-				added = true;
-			    }
-			else
-			    {
-				System.out.println("Writing normally");
-				req_b.put(byteArray,0, byteArray.length);
-				updateWriteIndex(WriteIndex + byteArray.length);
-				added = true;
-			    }
+			System.out.println("Writing normally at " + WriteIndex);
+			req_b.put(byteArray,0, byteArray.length);
+			updateWriteIndex(WriteIndex + bytesNeeded);
+			added = true;
 		    }
-		else
+		else if (!endOfBufferFlag) // we bumped into reader
 		    {
-			System.out.println("Not enough buffer space available, waiting for reader to advance");
+			System.out.println("Reader has not advanced enough to write data");
+			TimeUnit.SECONDS.sleep(1);
 		    }
+		else // end of buffer was reached, need to write from starting index again
+		    {
+			System.out.println("End of buffer reached, starting from beginning");
+			markEnd(); //telling reader it should start reading from beginning again
+			updateWriteIndex(BufferStartIndex);
+			endOfBufferFlag = false;
+			TimeUnit.SECONDS.sleep(1);
+		    }			
+	    }	    
+    }
+
+    private static void markEnd()
+    {
+	if(WriteIndex < BufferSize + BufferStartIndex) 
+	    {
+		System.out.println("Marking end at " + WriteIndex);
+		req_b.put((byte)0xFF); //reader will see this byte and know it has to read from start again
 	    }
     }
-    private static int getBytesAvailable()
-    {
+    
+    private static int getBytesAvailable() //returns how many bytes left till end of buffer or the read index,
+    {                                      //sets a flag telling which one marks the end of available bytes
 	ReadIndex = getReadIndex();
 	if(WriteIndex > ReadIndex)
 	    {
-		return BufferSize - (WriteIndex - ReadIndex);
+		endOfBufferFlag = true;
+		return BufferSize + BufferStartIndex - WriteIndex;
 	    }
 	else if(WriteIndex < ReadIndex)
 	    {
+		endOfBufferFlag = false;
 		return ReadIndex - WriteIndex;
 	    }
-	else return BufferSize;
+	else
+	    {
+		//need to check what happened before,
+		//did reader catch up to the writer,
+		//or vice versa
+		if(!endOfBufferFlag)
+		    
+		    { // writer bumped into reader
+			System.out.println("Bumped into reader");
+			//	System.exit(0);
+			return 0;
+		    }
+		else // reader caught up to writer
+		    {
+			System.out.println("Reader caught up");
+			return BufferSize + BufferStartIndex - WriteIndex;
+			
+		    }
+	    }
     }
     private static void updateWriteIndex(int newIndex)
     {
-	/*	if(newIndex >= BufferSize + BufferStartIndex)
-	    {
-		newIndex = BufferStartIndex;
-		}*/
 	WriteIndex = newIndex;
-	int prevPosition = req_b.position();
+	//	int prevPosition = req_b.position();
 	req_b.position(0);
 	req_b.put(deconstructNumber(newIndex));
-	req_b.position(prevPosition);
+	req_b.position(newIndex);
     }
     
     private static void updateReadIndex(int newIndex)
