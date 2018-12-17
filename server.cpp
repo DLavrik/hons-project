@@ -78,6 +78,7 @@ public:
   char* chbuffer;
   int ReadIndex;
   int WriteIndex;
+  bool endOfBufferFlag;
   MMappedBuffer(const char * filename)
   {
     fd = open(filename, O_RDWR | O_CREAT, (mode_t)0600);
@@ -110,8 +111,9 @@ public:
 	exit(EXIT_FAILURE);
     }
     chbuffer = (char*) buffer;
-    setReadIndex(BUFFER_START_INDEX);
+    setReadIndex(BUFFER_START_INDEX - 1);
     setWriteIndex(BUFFER_START_INDEX);
+    endOfBufferFlag = true;
   }
 
   ~MMappedBuffer()
@@ -129,7 +131,7 @@ public:
     ReadIndex = newIndex;
     vector<unsigned char> num = intToBytes(newIndex);
     chbuffer[4] = num[0];
-    chbuffer[5] = num[1]; // consider memory barrier as well
+    chbuffer[5] = num[1];
     chbuffer[6] = num[2];
     chbuffer[7] = num[3];
   }
@@ -138,41 +140,21 @@ public:
   {
     WriteIndex = newIndex;
     vector<unsigned char> num = intToBytes(newIndex);
+    
     chbuffer[0] = num[0]; 
     chbuffer[1] = num[1]; //make this atomic, only works on aligned values
     chbuffer[2] = num[2];
     chbuffer[3] = num[3];
   } 
 
-  //int size = int( (unsigned char)(buffer[index]) << 24 | (unsigned char)(buffer[index+1]) << 16 | (unsigned char)(buffer[index+2]) << 8 | (unsigned char)(buffer[index+3]) ); 
-  /*  
-  int getIntFromBuffer(int index)
-  {
-    int nextAccessIndex = index;
-    int result;
-    vector<char> temp;
-    for(int i = 0;i < 4; i++) //use 8 byte alignment
-      {
-	cout<< "Next Access Index : " << nextAccessIndex <<endl;
-	//	result |= (int)((unsigned char)(chbuffer[nextAccessIndex]) << (3 - i)*8); 
-	temp.push_back(chbuffer[nextAccessIndex]);
-	if(nextAccessIndex < BUFFER_SIZE + BUFFER_START_INDEX - 1)
-	  {
-	    nextAccessIndex++;
-	  }
-	else nextAccessIndex = BUFFER_START_INDEX;
-      }
-    setReadIndex(nextAccessIndex);
-    return getSizeFromBuffer(temp,0);
-  }
-  */
   void checkEndMark()
   {
     cout<<"READ index at check end mark " << ReadIndex <<" Write index " <<WriteIndex << endl;
-    if( (ReadIndex >= BUFFER_SIZE + BUFFER_START_INDEX) || (chbuffer[ReadIndex] == 0xFF))
+       if( (ReadIndex >= BUFFER_SIZE + BUFFER_START_INDEX - 1) || (chbuffer[ReadIndex+1] == 0xFF))
       {
-      setReadIndex(BUFFER_START_INDEX);
-      cout<<"RESETTING" <<endl;
+	//setReadIndex(BUFFER_START_INDEX - 1);
+	ReadIndex = BUFFER_START_INDEX - 1;
+	cout<<"Local ReadIndex reset" <<endl;
       }
   }
 
@@ -183,77 +165,103 @@ public:
       newIndex = index + ALLIGNMENT - (index % ALLIGNMENT);
     return newIndex; 
   }
+
+  bool gotBytesToRead()
+  {
+    sleep(1);
+    if(WriteIndex-1 == ReadIndex)
+      return false;
+    if((WriteIndex == BUFFER_START_INDEX) &&( ReadIndex == BUFFER_START_INDEX + BUFFER_SIZE - 1)){
+      cout<<"special case no bytes left to read, " << WriteIndex << ", " << ReadIndex <<endl;
+      // exit(EXIT_FAILURE);
+      return false;
+    }
+    return true;
+  }
+
+  int getNextReadIndex()
+  {
+    if(ReadIndex < BUFFER_START_INDEX + BUFFER_SIZE - 1)
+      return ReadIndex + 1;
+    else return BUFFER_START_INDEX;
+  }
+  
   
   vector<char> readNext()
   {
     vector<char> result;
     WriteIndex = getWriteIndex();
-    checkEndMark();
-    if(ReadIndex != WriteIndex)      
+    cout<<"WriteIndex: " << WriteIndex <<endl;
+    if(gotBytesToRead())      
       {// this means we have some data to read
        // first we have to get the next request in vector form
+	checkEndMark(); // check if we need to start reading from start again
 	cout<<"Found unread data, write index: "<< WriteIndex << " , Read Index: " << ReadIndex <<endl;
 	//exit(EXIT_FAILURE);
-	int msgSize = getSizeFromBuffer(chbuffer, ReadIndex);
+	int msgSize = getSizeFromBuffer(chbuffer, ReadIndex + 1);
 	setReadIndex(ReadIndex + 4);
 	cout<<"Message Size " << msgSize << endl;
 	
-	result.assign(chbuffer + ReadIndex, chbuffer + ReadIndex + msgSize);
+	result.assign(chbuffer + ReadIndex + 1,chbuffer + ReadIndex + 1 + msgSize);
 	setReadIndex(ReadIndex + allign(msgSize));
 	  
-	return result;
       }
     else{
-      //  cout<<"Nothing to read, read index " << ReadIndex <<endl;
+        cout<<"Nothing to read, read index " << ReadIndex <<endl;
     }
+    return result;
   }
 
   void addToBuffer(string response)
-    // writes response starting at position WriteIndex, overlaps if reaches end of buffer
-	
-    {
-	bool added = false;
+    // writes response starting at position WriteIndex, overlaps if reaches end of buffer 
+  {
+    bool added = false;
 	while(!added)
-	    {
-		int bytesAvailable = getBytesAvailable();
-		cout << "Bytes available: " << bytesAvailable << " \n";
-		if(bytesAvailable >= response.length())
-		    {
-		      if(BUFFER_SIZE + BUFFER_START_INDEX - WriteIndex <= response.length()) // need to overlap
-			    {
-			      cout<< "Splitting \n";
-			      copy(response.begin(),response.begin() + BUFFER_SIZE + BUFFER_START_INDEX - WriteIndex, chbuffer + WriteIndex);
-			      copy(response.begin() + BUFFER_SIZE + BUFFER_START_INDEX - WriteIndex , response.end(), chbuffer + BUFFER_START_INDEX);
-			      setWriteIndex(BUFFER_START_INDEX + response.length() - (BUFFER_SIZE + BUFFER_START_INDEX - WriteIndex));
-			      added = true;
-			    }
-			else
-			    {
-			      cout<< "Writing normally";
-			      copy(response.begin(),response.end(),chbuffer + WriteIndex);
-			      setWriteIndex(WriteIndex + response.length());
-			      added = true;
-			    }
-		    }
-		else
-		    {
-		      cout << "Not enough buffer space available, waiting for reader to advance\n";
-		    }
-	    }
-    }
-
+	  {
+	    int bytesAvailable = getBytesAvailable();
+	    int allignedBytesAvailable = bytesAvailable - (bytesAvailable % ALLIGNMENT);
+	    int bytesNeeded = allign(response.length());
+	    cout << "Alligned Bytes available: " << allignedBytesAvailable << " \n";
+	    if(allignedBytesAvailable >= bytesNeeded)
+	      {
+		cout<< "Writing normally";
+		copy(response.begin(),response.end(),chbuffer + WriteIndex);
+		setWriteIndex(WriteIndex + response.length());
+		added = true;
+	      }
+	    else if(!endOfBufferFlag)
+	      {
+		cout << "Reader has not advanced enough to write data\n";
+	      }
+	    else
+	      {
+		cout << "End of buffer reached, starting from beginning\n";
+		markEnd();
+		WriteIndex = BUFFER_START_INDEX;
+	      }
+	  }
+  }
+  
+  void markEnd()
+  {
+    if(WriteIndex < BUFFER_SIZE + BUFFER_START_INDEX) 
+      {
+	cout << "Marking end at " << WriteIndex << "\n";
+	chbuffer[WriteIndex] = 0xFF; //reader will see this byte and know it has to read from start again
+      }
+  }
+  
   int getBytesAvailable()
     {
 	ReadIndex = getReadIndex();
 	if(WriteIndex > ReadIndex)
 	    {
-		return BUFFER_SIZE - (WriteIndex - ReadIndex);
+		return BUFFER_SIZE + BUFFER_START_INDEX - WriteIndex;
 	    }
-	else if(WriteIndex < ReadIndex)
+	else
 	    {
 		return ReadIndex - WriteIndex;
 	    }
-	else return BUFFER_SIZE;
     }
   
   int getWriteIndex()
@@ -670,8 +678,8 @@ int main(int argc , char *argv[])
       //    cout<< "Request size " << request.size()<< endl;
       //cout<< "request: \n";
       
-      for (int i = 0;i< request.size();i++)
-	cout << request[i];
+      //  for (int i = 0;i< request.size();i++)
+      //	cout << request[i];
       /*
       if(request.size() > 0)
 	{

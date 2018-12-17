@@ -36,11 +36,15 @@ public class testclient {
 
         req_b = req_channel.map( MapMode.READ_WRITE, 0, BufferSize + BufferStartIndex);
 	resp_b = resp_channel.map( MapMode.READ_WRITE, 0 , BufferSize + BufferStartIndex);
-	req_b.position(BufferStartIndex);
-	resp_b.position(BufferStartIndex);
-	updateReadIndex(BufferStartIndex);
-	updateWriteIndex(BufferStartIndex);	
 
+	//updateReadIndex(BufferStartIndex -1);
+	ReadIndex = getReadIndex();
+	System.out.println("GOT initial read index " + ReadIndex);
+	WriteIndex = getWriteIndex();
+	//updateWriteIndex(BufferStartIndex);	
+	req_b.position(WriteIndex);
+	resp_b.position(BufferStartIndex);
+	
 	message.write("R".getBytes(),0,1);
 	message.write(deconstructNumber(4));
 	message.write("test".getBytes(),0,4);
@@ -78,6 +82,7 @@ public class testclient {
 		int bytesAvailable = getBytesAvailable();
 		int allignedBytesAvailable = bytesAvailable - (bytesAvailable % ALLIGNMENT);
 		int bytesNeeded = allign(byteArray.length);
+		System.out.println("Read index : " + ReadIndex + " Write Index " + WriteIndex);
 		if(allignedBytesAvailable >= bytesNeeded) // we can write to buffer
 		    {
 			System.out.println("Writing normally at " + WriteIndex);
@@ -94,7 +99,9 @@ public class testclient {
 		    {
 			System.out.println("End of buffer reached, starting from beginning");
 			markEnd(); //telling reader it should start reading from beginning again
-			updateWriteIndex(BufferStartIndex);
+			//updateWriteIndex(BufferStartIndex);
+			WriteIndex = BufferStartIndex;
+			req_b.position(BufferStartIndex);
 			endOfBufferFlag = false;
 			TimeUnit.SECONDS.sleep(1);
 		    }			
@@ -118,13 +125,15 @@ public class testclient {
 		endOfBufferFlag = true;
 		return BufferSize + BufferStartIndex - WriteIndex;
 	    }
-	else if(WriteIndex < ReadIndex)
+	else //if(WriteIndex <= ReadIndex)
 	    {
 		endOfBufferFlag = false;
 		return ReadIndex - WriteIndex;
 	    }
-	else
+	/*	else
 	    {
+		System.out.println("This shouldnt happen");
+		/*
 		//need to check what happened before,
 		//did reader catch up to the writer,
 		//or vice versa
@@ -140,8 +149,8 @@ public class testclient {
 			System.out.println("Reader caught up");
 			return BufferSize + BufferStartIndex - WriteIndex;
 			
-		    }
-	    }
+			} 
+			} */
     }
     private static void updateWriteIndex(int newIndex)
     {
@@ -164,5 +173,9 @@ public class testclient {
     private static int getReadIndex()
     {
 	return req_b.getInt(4);
+    }
+    private static int getWriteIndex()
+    {
+	return req_b.getInt(0);
     }
 }
